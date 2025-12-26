@@ -3,6 +3,8 @@ import asyncio
 import resend
 from datetime import datetime, timedelta
 import statistics
+import json
+import os
 
 class OKXVolatilityBot:
     def __init__(self, api_key, api_secret, passphrase, resend_key, target_email, testnet=False):
@@ -45,6 +47,10 @@ class OKXVolatilityBot:
         self.positions = {}
         self.initial_balance = 0
         self.trade_history = []
+        
+        # --- Persistence Settings (for Render restarts) ---
+        self.state_file = "bot_state.json"
+        self.load_state()  # Load previous state on startup
 
     def send_notification(self, subject, message):
         """Sends email via Resend"""
@@ -58,6 +64,123 @@ class OKXVolatilityBot:
             print(f"📧 Email Sent: {subject}")
         except Exception as e:
             print(f"❌ Email error: {e}")
+
+    def save_state(self):
+        """Saves bot state to JSON file for persistence across restarts"""
+        try:
+            # Convert datetime objects to strings for JSON serialization
+            state = {
+                'positions': {},
+                'trade_history': [],
+                'initial_balance': self.initial_balance,
+                'last_scan_time': self.last_scan_time.isoformat() if self.last_scan_time != datetime.min else None,
+                'watchlist': self.watchlist
+            }
+            
+            # Serialize positions
+            for pos_id, pos in self.positions.items():
+                state['positions'][pos_id] = {
+                    'symbol': pos['symbol'],
+                    'quantity': pos['quantity'],
+                    'entry_price': pos['entry_price'],
+                    'take_profit': pos['take_profit'],
+                    'stop_loss': pos['stop_loss'],
+                    'entry_time': pos['entry_time'].isoformat(),
+                    'rsi_entry': pos['rsi_entry'],
+                    'position_in_range': pos['position_in_range']
+                }
+            
+            # Serialize trade history
+            for trade in self.trade_history:
+                state['trade_history'].append({
+                    'symbol': trade['symbol'],
+                    'entry_price': trade['entry_price'],
+                    'exit_price': trade['exit_price'],
+                    'quantity': trade['quantity'],
+                    'pnl_pct': trade['pnl_pct'],
+                    'pnl_usd': trade['pnl_usd'],
+                    'reason': trade['reason'],
+                    'entry_time': trade['entry_time'].isoformat(),
+                    'exit_time': trade['exit_time'].isoformat(),
+                    'duration': str(trade['duration']),
+                    'balance_after': trade['balance_after']
+                })
+            
+            with open(self.state_file, 'w') as f:
+                json.dump(state, f, indent=2)
+            
+            print("💾 State saved successfully")
+        except Exception as e:
+            print(f"❌ Failed to save state: {e}")
+
+    def load_state(self):
+        """Loads bot state from JSON file if it exists"""
+        try:
+            if not os.path.exists(self.state_file):
+                print("📝 No previous state found - starting fresh")
+                return
+            
+            with open(self.state_file, 'r') as f:
+                state = json.load(f)
+            
+            # Restore positions
+            for pos_id, pos in state.get('positions', {}).items():
+                self.positions[pos_id] = {
+                    'symbol': pos['symbol'],
+                    'quantity': pos['quantity'],
+                    'entry_price': pos['entry_price'],
+                    'take_profit': pos['take_profit'],
+                    'stop_loss': pos['stop_loss'],
+                    'entry_time': datetime.fromisoformat(pos['entry_time']),
+                    'rsi_entry': pos['rsi_entry'],
+                    'position_in_range': pos['position_in_range']
+                }
+            
+            # Restore trade history
+            for trade in state.get('trade_history', []):
+                duration_parts = trade['duration'].split(':')
+                self.trade_history.append({
+                    'symbol': trade['symbol'],
+                    'entry_price': trade['entry_price'],
+                    'exit_price': trade['exit_price'],
+                    'quantity': trade['quantity'],
+                    'pnl_pct': trade['pnl_pct'],
+                    'pnl_usd': trade['pnl_usd'],
+                    'reason': trade['reason'],
+                    'entry_time': datetime.fromisoformat(trade['entry_time']),
+                    'exit_time': datetime.fromisoformat(trade['exit_time']),
+                    'duration': timedelta(hours=int(duration_parts[0]), 
+                                         minutes=int(duration_parts[1]), 
+                                         seconds=int(duration_parts[2].split('.')[0])),
+                    'balance_after': trade['balance_after']
+                })
+            
+            # Restore other state
+            self.initial_balance = state.get('initial_balance', 0)
+            self.watchlist = state.get('watchlist', [])
+            
+            if state.get('last_scan_time'):
+                self.last_scan_time = datetime.fromisoformat(state['last_scan_time'])
+            
+            if self.positions:
+                print(f"🔄 RESUMED: Found {len(self.positions)} ongoing trade(s)")
+                for pos_id, pos in self.positions.items():
+                    print(f"   └─ {pos['symbol']} opened at ${pos['entry_price']:.6f}")
+                    
+                # Send resume notification
+                resume_msg = "<h2>🔄 Bot Resumed After Restart</h2>"
+                resume_msg += f"<p><strong>Active Positions:</strong> {len(self.positions)}</p>"
+                resume_msg += "<ul>"
+                for pos in self.positions.values():
+                    resume_msg += f"<li><strong>{pos['symbol']}</strong> - Entry: ${pos['entry_price']:.6f} | TP: ${pos['take_profit']:.6f} | SL: ${pos['stop_loss']:.6f}</li>"
+                resume_msg += "</ul>"
+                resume_msg += f"<p><strong>Total Trades Completed:</strong> {len(self.trade_history)}</p>"
+                self.send_notification("🔄 Bot Resumed - Trade Ongoing", resume_msg)
+            else:
+                print("✅ State loaded - no active positions")
+            
+        except Exception as e:
+            print(f"⚠️ Failed to load state: {e} - starting fresh")
 
     async def get_balance(self, currency='USDT'):
         """Fetches current balance"""
@@ -133,6 +256,7 @@ class OKXVolatilityBot:
             self.send_notification("🔍 Watchlist Updated - Top Volatile Coins", report)
             
             self.last_scan_time = datetime.now()
+            self.save_state()  # Save state after updating watchlist
             print(f"✅ Watchlist updated with {len(self.watchlist)} coins")
             
         except Exception as e:
@@ -286,6 +410,7 @@ class OKXVolatilityBot:
             entry_report = self.generate_entry_report(self.positions[pos_id], coin_data)
             self.send_notification(f"🎯 TRADE OPENED: {symbol}", entry_report)
             
+            self.save_state()  # Save state after opening position
             print(f"✅ Position opened: {symbol} at ${entry_price}")
             
         except Exception as e:
@@ -355,6 +480,7 @@ class OKXVolatilityBot:
             # Remove position
             del self.positions[pos_id]
             
+            self.save_state()  # Save state after closing position
             print(f"✅ Position closed: {symbol} | P&L: {pnl_pct:.2f}% (${pnl_usd:.2f})")
             
         except Exception as e:
@@ -434,13 +560,22 @@ class OKXVolatilityBot:
         self.running = True
         await self.exchange.load_markets()
         
-        self.initial_balance = await self.get_balance()
-        print(f"🤖 Bot Started | Balance: ${self.initial_balance:.2f}")
+        # Only set initial balance if not resuming
+        if not self.initial_balance:
+            self.initial_balance = await self.get_balance()
+            self.save_state()
         
-        startup_msg = f"<h2>🤖 Volatility Bot Started</h2><p><strong>Starting Balance:</strong> ${self.initial_balance:.2f}</p>"
-        startup_msg += f"<p><strong>Strategy:</strong> 3% Take Profit / 3% Stop Loss</p>"
-        startup_msg += f"<p><strong>Target:</strong> Top 20 volatile mid-tier coins</p>"
-        self.send_notification("🤖 Bot Online", startup_msg)
+        current_balance = await self.get_balance()
+        print(f"🤖 Bot Started | Initial: ${self.initial_balance:.2f} | Current: ${current_balance:.2f}")
+        
+        # Only send startup email if no positions (fresh start)
+        if not self.positions:
+            startup_msg = f"<h2>🤖 Volatility Bot Started</h2><p><strong>Starting Balance:</strong> ${self.initial_balance:.2f}</p>"
+            startup_msg += f"<p><strong>Strategy:</strong> 3% Take Profit / 3% Stop Loss</p>"
+            startup_msg += f"<p><strong>Target:</strong> Top 20 volatile mid-tier coins</p>"
+            if len(self.trade_history) > 0:
+                startup_msg += f"<p><strong>Previous Trades:</strong> {len(self.trade_history)}</p>"
+            self.send_notification("🤖 Bot Online", startup_msg)
         
         while self.running:
             try:
@@ -475,12 +610,38 @@ class OKXVolatilityBot:
         self.running = False
         print("🛑 Bot stopping...")
         
-        # Close any open positions
-        for pos_id in list(self.positions.keys()):
-            ticker = await self.exchange.fetch_ticker(self.positions[pos_id]['symbol'])
-            await self.close_position(pos_id, ticker['last'], "Bot Shutdown")
+        # Save state before stopping
+        self.save_state()
+        
+        # Only close positions if explicitly requested (not on normal Render restarts)
+        # Positions will be preserved and resumed on restart
+        print(f"💾 State saved with {len(self.positions)} active position(s)")
         
         await self.exchange.close()
+
+    async def health_check_server(self):
+        """Simple HTTP server for Render health checks"""
+        from aiohttp import web
+        
+        async def health(request):
+            status = {
+                'status': 'running',
+                'active_positions': len(self.positions),
+                'total_trades': len(self.trade_history),
+                'balance': await self.get_balance(),
+                'uptime': str(datetime.now() - self.start_time) if hasattr(self, 'start_time') else 'N/A'
+            }
+            return web.json_response(status)
+        
+        app = web.Application()
+        app.router.add_get('/health', health)
+        app.router.add_get('/', health)
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get('PORT', 10000)))
+        await site.start()
+        print(f"🌐 Health check server running on port {os.environ.get('PORT', 10000)}")
 
 # --- EXECUTION ---
 if __name__ == "__main__":
@@ -490,11 +651,19 @@ if __name__ == "__main__":
         passphrase="Alphaxide@2003", 
         resend_key="re_1URbBz6v_8p6JsriYBLGoxkF2Srq5ZBZ2", 
         target_email="kalphaxide@gmail.com", 
-        testnet=False
+        testnet=False  # Set to True for testing
     )
     
+    bot.start_time = datetime.now()
+    
+    async def run_bot():
+        # Start health check server for Render
+        await bot.health_check_server()
+        # Start trading bot
+        await bot.start()
+    
     try:
-        asyncio.run(bot.start())
+        asyncio.run(run_bot())
     except KeyboardInterrupt:
         print("\n⚠️ Interrupted by user")
         asyncio.run(bot.stop())
