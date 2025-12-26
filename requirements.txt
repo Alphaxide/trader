@@ -1,0 +1,3 @@
+ccxt>=4.1.0
+asyncio
+aiohttp
